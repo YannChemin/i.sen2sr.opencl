@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <grass/gis.h>
 #include <grass/glocale.h>
@@ -25,6 +26,35 @@
 
 static const char *band_suffix[S2_NBANDS] = {"B02", "B03", "B04", "B05", "B06",
                                              "B07", "B08", "B8A", "B11", "B12"};
+
+/* Bundled model directories (see models/README.md), by variant. */
+static const struct {
+    const char *name;
+    enum sr_variant variant;
+} bundled[] = {
+    {"main", SR_ALL_X4}, {"rgbn_x4", SR_RGBN_X4}, {"rswir_x2", SR_RSWIR_X2}};
+
+/* Path of a bundled model directory installed with the module, searched
+ * like G_find_etc() (GRASS_ADDON_ETC, then $GISBASE/etc) and in the
+ * etc directory of GRASS_ADDON_BASE, where g.extension installs addon
+ * data files. NULL if not found. */
+static char *find_bundled_model(const char *name)
+{
+    char rel[GPATH_MAX], path[GPATH_MAX];
+    const char *addon_base = getenv("GRASS_ADDON_BASE");
+    char *found;
+
+    snprintf(rel, sizeof(rel), "i.sen2sr.opencl/models/%s", name);
+    found = G_find_etc(rel);
+    if (found)
+        return found;
+    if (addon_base) {
+        snprintf(path, sizeof(path), "%s/etc/%s", addon_base, rel);
+        if (access(path, F_OK) == 0)
+            return G_store(path);
+    }
+    return NULL;
+}
 
 /* Tile origins along an axis of padded length len (>= SR_TILE, even), and
  * the first index of each tile's core, where its output is kept: cores
@@ -95,8 +125,8 @@ static void check_grid(const struct Cell_head *win, const char **names,
 int main(int argc, char *argv[])
 {
     struct GModule *module;
-    struct Option *band_opt[S2_NBANDS], *output, *model_dir, *scale_opt,
-        *offset_opt, *overlap_opt, *device, *platform;
+    struct Option *band_opt[S2_NBANDS], *output, *model_opt, *model_dir,
+        *scale_opt, *offset_opt, *overlap_opt, *device, *platform;
     static const char *band_key[S2_NBANDS] = {
         "blue",     "green", "red",   "rededge1", "rededge2",
         "rededge3", "nir",   "nir08", "swir16",   "swir22"};
@@ -124,7 +154,9 @@ int main(int argc, char *argv[])
     int S, T = SR_TILE, H, W, Hp, Wp, nin, nout, overlap, max_core;
     double scale, offset;
     size_t tile_plane, out_plane, hr_cols;
-    int i, b, r, c;
+    const char *model_name, *model_path;
+    char *desc;
+    int i, b, r, c, has_20m;
 
     G_gisinit(argv[0]);
 
@@ -153,13 +185,31 @@ int main(int argc, char *argv[])
         _("Basename for output raster maps, suffixed with the band name "
           "(e.g. _B02)");
 
+    model_opt = G_define_option();
+    model_opt->key = "model";
+    model_opt->type = TYPE_STRING;
+    model_opt->options = "auto,main,rgbn_x4,rswir_x2";
+    model_opt->answer = "auto";
+    model_opt->label = _("SEN2SRLite model");
+    model_opt->description =
+        _("The three models are installed with the module; auto uses main "
+          "when 20 m bands are given, else rgbn_x4");
+    G_asprintf(&desc, "auto;%s;main;%s;rgbn_x4;%s;rswir_x2;%s",
+               _("main if any 20 m band is given, else rgbn_x4"),
+               _("all 10 bands to 2.5 m"), _("B02, B03, B04, B08 to 2.5 m"),
+               _("20 m bands to 10 m, guided by the 10 m bands"));
+    model_opt->descriptions = desc;
+    model_opt->guisection = _("Model");
+
     model_dir = G_define_standard_option(G_OPT_M_DIR);
     model_dir->key = "model_dir";
-    model_dir->label = _("SEN2SRLite model directory");
+    model_dir->required = NO;
+    model_dir->label = _("Directory of other SEN2SRLite weights");
     model_dir->description =
-        _("Directory of one SEN2SRLite variant as downloaded from "
-          "huggingface.co/tacofoundation/SEN2SR (main, NonReference_RGBN_x4 "
-          "or Reference_RSWIR_x2)");
+        _("Use the weights in this directory (one SEN2SRLite variant as "
+          "published at huggingface.co/tacofoundation/SEN2SR) instead of "
+          "the installed ones");
+    model_dir->guisection = _("Model");
 
     scale_opt = G_define_option();
     scale_opt->key = "scale";
@@ -219,8 +269,37 @@ int main(int argc, char *argv[])
         G_fatal_error(_("Option <%s> must be an even number of cells"),
                       overlap_opt->key);
 
+    /* Model choice: auto picks the model that uses the given bands. The
+     * 20 m-to-10 m model is a different product (10 m output) and is only
+     * used on request. */
+    has_20m = 0;
+    for (b = 0; b < S2_NBANDS; b++)
+        if (b != B02 && b != B03 && b != B04 && b != B08 && band_opt[b]->answer)
+            has_20m = 1;
+    model_name = strcmp(model_opt->answer, "auto") != 0 ? model_opt->answer
+                 : has_20m                              ? "main"
+                                                        : "rgbn_x4";
+    if (model_dir->answer)
+        model_path = model_dir->answer;
+    else {
+        model_path = find_bundled_model(model_name);
+        if (!model_path)
+            G_fatal_error(_("The installed SEN2SRLite model <%s> was not "
+                            "found; reinstall the module or give the weights "
+                            "with <%s>"),
+                          model_name, model_dir->key);
+    }
+
     ocl_init(&ocl, device->answer, platform->answer);
-    sr_model_load(&model, &ocl, model_dir->answer);
+    sr_model_load(&model, &ocl, model_path);
+    if (model_dir->answer && strcmp(model_opt->answer, "auto") != 0) {
+        for (i = 0; i < (int)(sizeof(bundled) / sizeof(bundled[0])); i++)
+            if (strcmp(bundled[i].name, model_opt->answer) == 0 &&
+                bundled[i].variant != model.variant)
+                G_fatal_error(_("<%s> holds the %s model, not <%s>"),
+                              model_dir->answer, sr_variant_name(model.variant),
+                              model_opt->answer);
+    }
     S = model.scale;
     nin = model.nin;
     nout = model.nout;

@@ -2,10 +2,11 @@
 
 import grass.script as gs
 import pytest
-from conftest import BAND_KEYS, COLS, RES, ROWS, band_options
+from conftest import BAND_KEYS, COLS, RES, ROWS, band_options, bundled_model
 from grass.tools import ToolError, Tools
 
 RGBN = ("blue", "green", "red", "nir")
+TWENTY_M = ("rededge1", "rededge2", "rededge3", "nir08", "swir16", "swir22")
 
 
 def native_univar(session, name):
@@ -52,41 +53,74 @@ def test_rejects_file_that_is_not_safetensors(session, tmp_path, device_options)
         )
 
 
-def test_rgbn_model_refuses_unused_band(session, rgbn_model, device_options):
+def test_rgbn_model_refuses_unused_band(session, device_options):
     """Bands the model does not read are refused, not silently dropped."""
     tools = Tools(session=session)
 
     with pytest.raises(ToolError, match="not used"):
         tools.i_sen2sr_opencl(
             output="out",
-            model_dir=rgbn_model,
+            model="rgbn_x4",
             **band_options(*RGBN, "swir16"),
             **device_options,
         )
 
 
-def test_main_model_needs_all_bands(session, main_model, device_options):
+def test_main_model_needs_all_bands(session, device_options):
     """The main model reads all ten bands."""
     tools = Tools(session=session)
 
     with pytest.raises(ToolError, match="rededge1"):
         tools.i_sen2sr_opencl(
             output="out",
-            model_dir=main_model,
+            model="main",
             **band_options(*RGBN),
             **device_options,
         )
 
 
+def test_auto_with_some_20m_bands_asks_for_all(session, device_options):
+    """With any 20 m band, auto chooses the main model, which then asks for
+    the missing ones instead of dropping the given band."""
+    tools = Tools(session=session)
+
+    with pytest.raises(ToolError, match="main"):
+        tools.i_sen2sr_opencl(
+            output="out", **band_options(*RGBN, "swir16"), **device_options
+        )
+
+
+def test_model_dir_must_hold_requested_model(session, device_options):
+    """Custom weights of another variant than <model> are refused."""
+    tools = Tools(session=session)
+    rgbn_dir = bundled_model(session.env, "rgbn_x4")
+
+    with pytest.raises(ToolError, match=r"holds\s+the"):
+        tools.i_sen2sr_opencl(
+            output="out",
+            model="main",
+            model_dir=rgbn_dir,
+            **band_options(*BAND_KEYS),
+            **device_options,
+        )
+
+
 @pytest.fixture(scope="module")
-def rgbn_run(session, rgbn_model, device_options):
-    """Run the RGBN x4 model once for the result checks."""
+def rgbn_run(session, device_options):
+    """Run once with the four 10 m bands, for which auto chooses the RGBN
+    x4 model, for the result checks."""
     tools = Tools(session=session)
     region = tools.g_region(flags="g", format="json").json
-    tools.i_sen2sr_opencl(
-        output="sr", model_dir=rgbn_model, **band_options(*RGBN), **device_options
-    )
+    tools.i_sen2sr_opencl(output="sr", **band_options(*RGBN), **device_options)
     return session, tools, region
+
+
+def test_auto_with_10m_bands_uses_rgbn(rgbn_run):
+    """Auto with only the 10 m bands writes exactly those four bands."""
+    _, tools, _ = rgbn_run
+    maps = tools.g_list(type="raster", pattern="sr_*", format="json").json
+
+    assert sorted(m["name"] for m in maps) == ["sr_B02", "sr_B03", "sr_B04", "sr_B08"]
 
 
 def test_rgbn_region_is_not_changed(rgbn_run):
@@ -138,25 +172,20 @@ def test_rgbn_null_input_cell_gives_null_block(rgbn_run):
     assert values[0]["sr_B02"]["value"] is None
 
 
-def test_existing_output_needs_overwrite(rgbn_run, rgbn_model, device_options):
+def test_existing_output_needs_overwrite(rgbn_run, device_options):
     """Output maps are only replaced with --overwrite."""
     _, tools, _ = rgbn_run
 
     with pytest.raises(ToolError, match="already exists"):
-        tools.i_sen2sr_opencl(
-            output="sr",
-            model_dir=rgbn_model,
-            **band_options(*RGBN),
-            **device_options,
-        )
+        tools.i_sen2sr_opencl(output="sr", **band_options(*RGBN), **device_options)
 
 
-def test_main_model_all_bands(session, main_model, device_options):
-    """The main model writes all ten bands at 2.5 m."""
+def test_main_model_all_bands(session, device_options):
+    """With all ten bands, auto chooses the main model, which writes all
+    ten bands at 2.5 m."""
     tools = Tools(session=session)
     tools.i_sen2sr_opencl(
         output="all",
-        model_dir=main_model,
         **band_options(*BAND_KEYS),
         **device_options,
     )
@@ -166,3 +195,39 @@ def test_main_model_all_bands(session, main_model, device_options):
         lr = tools.r_univar(map=f"s2_{band}", format="json").json
         hr = native_univar(session, f"all_{band}")
         assert hr["mean"] == pytest.approx(lr["mean"], rel=0.02), band
+
+
+def test_rswir_model_on_request(session, device_options):
+    """model=rswir_x2 writes the six 20 m bands on the 10 m region grid."""
+    tools = Tools(session=session)
+    tools.i_sen2sr_opencl(
+        output="ten",
+        model="rswir_x2",
+        **band_options(*BAND_KEYS),
+        **device_options,
+    )
+    maps = tools.g_list(type="raster", pattern="ten_*", format="json").json
+    assert sorted(m["name"] for m in maps) == sorted(
+        f"ten_{BAND_KEYS[key]}" for key in TWENTY_M
+    )
+    for key in TWENTY_M:
+        band = BAND_KEYS[key]
+        info = tools.r_info(map=f"ten_{band}", format="json").json
+        assert info["rows"] == ROWS
+        assert info["cols"] == COLS
+        lr = tools.r_univar(map=f"s2_{band}", format="json").json
+        hr = native_univar(session, f"ten_{band}")
+        assert hr["mean"] == pytest.approx(lr["mean"], rel=0.02), band
+
+
+def test_custom_model_dir_is_used(session, device_options):
+    """Weights given with model_dir replace the installed ones."""
+    tools = Tools(session=session)
+    tools.i_sen2sr_opencl(
+        output="custom",
+        model_dir=bundled_model(session.env, "rgbn_x4"),
+        **band_options(*RGBN),
+        **device_options,
+    )
+    info = tools.r_info(map="custom_B02", format="json").json
+    assert info["rows"] == 4 * ROWS

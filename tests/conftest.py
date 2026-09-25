@@ -1,11 +1,9 @@
 """pytest fixtures for i.sen2sr.opencl.
 
-The module always needs an OpenCL device (PoCL is enough). Tests that run
-a model need a SEN2SRLite model directory as downloaded from
-https://huggingface.co/tacofoundation/SEN2SR and are skipped unless its
-path is given in I_SEN2SR_OPENCL_RGBN (NonReference_RGBN_x4) or
-I_SEN2SR_OPENCL_MAIN (main). I_SEN2SR_OPENCL_PLATFORM optionally selects
-the OpenCL platform.
+The module always needs an OpenCL device (PoCL is enough). The three
+SEN2SRLite models are installed with the module, so the model tests need
+no download. I_SEN2SR_OPENCL_PLATFORM optionally selects the OpenCL
+platform.
 """
 
 import os
@@ -64,21 +62,18 @@ def session(tmp_path_factory):
         yield session
 
 
-def _model(variable):
-    path = os.environ.get(variable)
-    if not path or not (Path(path) / "model.safetensor").is_file():
-        pytest.skip(f"set {variable} to a SEN2SRLite model directory")
-    return path
-
-
-@pytest.fixture(scope="module")
-def rgbn_model():
-    return _model("I_SEN2SR_OPENCL_RGBN")
-
-
-@pytest.fixture(scope="module")
-def main_model():
-    return _model("I_SEN2SR_OPENCL_MAIN")
+def bundled_model(env, name):
+    """Installed directory of a bundled model, found where the module
+    looks for it (GRASS_ADDON_ETC, $GISBASE/etc, GRASS_ADDON_BASE/etc)."""
+    rel = Path("i.sen2sr.opencl", "models", name)
+    roots = env.get("GRASS_ADDON_ETC", "").split(":")
+    roots.append(str(Path(env["GISBASE"], "etc")))
+    if env.get("GRASS_ADDON_BASE"):
+        roots.append(str(Path(env["GRASS_ADDON_BASE"], "etc")))
+    for root in filter(None, roots):
+        if (Path(root) / rel / "model.safetensor").is_file():
+            return str(Path(root) / rel)
+    pytest.skip(f"bundled model <{name}> is not installed")
 
 
 @pytest.fixture(scope="module")
