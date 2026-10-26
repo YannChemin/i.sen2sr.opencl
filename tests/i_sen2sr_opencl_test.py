@@ -231,3 +231,49 @@ def test_custom_model_dir_is_used(session, device_options):
     )
     info = tools.r_info(map="custom_B02", format="json").json
     assert info["rows"] == 4 * ROWS
+
+
+@pytest.mark.parametrize("option", ["profile", "precision"])
+def test_rejects_invalid_device_option(session, option):
+    """profile= and precision= only take their listed values."""
+    tools = Tools(session=session)
+    with pytest.raises(ToolError):
+        tools.i_sen2sr_opencl(
+            output="out", **band_options(*RGBN), **{option: "nonsense"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "precision", "tolerance"),
+    [
+        ("cpu", "fp32", 1e-4),
+        ("igpu", "fp32", 1e-4),
+        ("dgpu", "fp32", 1e-4),
+        ("egpu", "fp32", 1e-4),
+        ("dgpu", "fp16", 5e-3),
+        ("cpu", "fp16", 5e-3),
+    ],
+)
+def test_profiles_and_precision_match_default(
+    rgbn_run, device_options, profile, precision, tolerance
+):
+    """Every profile gives the default result; half-precision feature maps
+    stay within a small relative error of it."""
+    session, tools, _ = rgbn_run
+    out = f"sr_{profile}_{precision}"
+    tools.i_sen2sr_opencl(
+        output=out,
+        profile=profile,
+        precision=precision,
+        **band_options(*RGBN),
+        **device_options,
+    )
+    env = session.env.copy()
+    env["GRASS_REGION"] = gs.region_env(raster="sr_B04", env=session.env)
+    native = Tools(env=env)
+    native.r_mapcalc(
+        expression=f"diff_{out} = abs({out}_B04 - sr_B04) / max(abs(sr_B04), 1)"
+    )
+    worst = native.r_univar(map=f"diff_{out}", format="json").json["max"]
+    print(f"{profile} {precision}: max relative difference {worst:.2e}")
+    assert worst <= tolerance
