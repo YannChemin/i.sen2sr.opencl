@@ -47,7 +47,9 @@ struct sr_model {
     enum s2_band in_bands[S2_NBANDS], out_bands[S2_NBANDS];
 
     struct ocl_backend *ocl;
-    cl_kernel k_conv, k_dec, k_rx, k_ry, k_diff, k_mask, k_add, k_fft;
+    int fp16; /* Feature maps stored as half (precision=fp16). */
+    cl_kernel k_conv, k_conv_cpu, k_dec, k_rx, k_ry, k_diff, k_mask, k_add,
+        k_fft;
 
     /* rgbn: RGBN x4 network (the whole model for SR_RGBN_X4).
      * f2: 20 m -> 10 m network (the whole model for SR_RSWIR_X2).
@@ -62,10 +64,12 @@ struct sr_model {
 };
 
 /* Load a SEN2SRLite model directory (as downloaded by mlstac) and
- * detect which variant it holds. Fatal on missing or malformed files and
- * on the non-Lite (Mamba) SEN2SR models, which are not supported. */
+ * detect which variant it holds. With fp16, the CNN feature maps are
+ * stored as half (arithmetic stays float). Fatal on missing or malformed
+ * files and on the non-Lite (Mamba) SEN2SR models, which are not
+ * supported. */
 void sr_model_load(struct sr_model *m, struct ocl_backend *ocl,
-                   const char *dir);
+                   const char *dir, int fp16);
 
 void sr_model_free(struct sr_model *m);
 

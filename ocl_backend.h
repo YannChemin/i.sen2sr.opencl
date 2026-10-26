@@ -10,6 +10,17 @@
 
 #include <stddef.h>
 
+/* Device profiles (profile= option). They choose the buffer strategy
+ * and the convolution kernel:
+ * - cpu:  host-memory device (PoCL): mapped buffers, a convolution
+ *         kernel streaming 8 pixels per work-item with vector loads.
+ * - igpu: GPU sharing host memory: zero-copy buffers (allocated in host
+ *         memory, written and read by mapping instead of copying).
+ * - dgpu: GPU with its own memory on internal PCIe: device buffers.
+ * - egpu: GPU behind a slow link (Thunderbolt, PoCL-Remote): device
+ *         buffers, transfers through a pinned staging buffer. */
+enum ocl_arch { OCL_ARCH_CPU, OCL_ARCH_IGPU, OCL_ARCH_DGPU, OCL_ARCH_EGPU };
+
 struct ocl_backend {
     cl_platform_id platform;
     cl_device_id device;
@@ -21,6 +32,12 @@ struct ocl_backend {
     cl_ulong max_alloc;
     cl_ulong global_mem;
     int is_gpu;
+    int unified; /* CL_DEVICE_HOST_UNIFIED_MEMORY. */
+    int arch;    /* enum ocl_arch. */
+    int profile; /* Per-kernel timing (I_SEN2SR_OPENCL_PROFILE set). */
+    cl_mem staging; /* Pinned staging buffer (egpu). */
+    void *staging_ptr;
+    size_t staging_size;
 };
 
 /* Select a device and build the embedded kernels.
@@ -28,10 +45,13 @@ struct ocl_backend {
  * device_opt is "auto" (first GPU, else first CPU device), "gpu" or
  * "cpu". platform_opt, when not NULL, restricts the search to platforms
  * whose name contains that substring (case-insensitive), e.g. "rusticl"
- * or "Portable". Fails with G_fatal_error() if no device matches: this
- * module has no non-OpenCL fallback. */
+ * or "Portable". profile_opt is "auto" or one of cpu, igpu, dgpu, egpu
+ * (see enum ocl_arch). Fails with G_fatal_error() if no device matches:
+ * this module has no non-OpenCL fallback. */
 void ocl_init(struct ocl_backend *ocl, const char *device_opt,
-              const char *platform_opt);
+              const char *platform_opt, const char *profile_opt);
+
+const char *ocl_arch_name(int arch);
 
 void ocl_free(struct ocl_backend *ocl);
 

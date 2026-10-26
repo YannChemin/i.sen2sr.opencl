@@ -11,6 +11,7 @@
  *****************************************************************************/
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -138,6 +139,7 @@ static int try_device(struct ocl_backend *ocl, const struct candidate *c,
     char version[128];
     const char *opts;
     cl_device_type type;
+    cl_bool unified;
     cl_int err;
 
     ocl->platform = c->platform;
@@ -152,6 +154,10 @@ static int try_device(struct ocl_backend *ocl, const struct candidate *c,
                     &ocl->global_mem, NULL);
     clGetDeviceInfo(c->device, CL_DEVICE_TYPE, sizeof(type), &type, NULL);
     ocl->is_gpu = (type & CL_DEVICE_TYPE_GPU) != 0;
+    unified = CL_FALSE;
+    clGetDeviceInfo(c->device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified),
+                    &unified, NULL);
+    ocl->unified = unified == CL_TRUE;
 
     /* The kernels are OpenCL C 1.1; request 1.2 where available. */
     version[0] = '\0';
@@ -164,7 +170,11 @@ static int try_device(struct ocl_backend *ocl, const struct candidate *c,
 
     ocl->context = clCreateContext(NULL, 1, &c->device, NULL, NULL, &err);
     ocl_check(err, "clCreateContext");
-    ocl->queue = clCreateCommandQueue(ocl->context, c->device, 0, &err);
+    /* Developer aid: I_SEN2SR_OPENCL_PROFILE=1 times every kernel. */
+    ocl->profile = getenv("I_SEN2SR_OPENCL_PROFILE") != NULL;
+    ocl->queue = clCreateCommandQueue(
+        ocl->context, c->device, ocl->profile ? CL_QUEUE_PROFILING_ENABLE : 0,
+        &err);
     ocl_check(err, "clCreateCommandQueue");
     ocl->program = clCreateProgramWithSource(ocl->context, 1, &src, &len, &err);
     ocl_check(err, "clCreateProgramWithSource");
@@ -192,8 +202,96 @@ static int try_device(struct ocl_backend *ocl, const struct candidate *c,
     return 0;
 }
 
+const char *ocl_arch_name(int arch)
+{
+    static const char *names[] = {"cpu", "igpu", "dgpu", "egpu"};
+
+    return arch >= 0 && arch <= OCL_ARCH_EGPU ? names[arch] : "?";
+}
+
+#ifndef CL_DEVICE_PCI_BUS_INFO_KHR
+#define CL_DEVICE_PCI_BUS_INFO_KHR 0x410F
+#endif
+#ifndef CL_DEVICE_PCI_BUS_ID_NV
+#define CL_DEVICE_PCI_BUS_ID_NV 0x4008
+#define CL_DEVICE_PCI_SLOT_ID_NV 0x4009
+#endif
+
+/* Non-zero when Linux marks the device's PCI function as removable
+ * (Thunderbolt / USB4 eGPU). The PCI address comes from
+ * cl_khr_pci_bus_info, or from the NVIDIA query; 0 when unknown. */
+static int pci_removable(const struct ocl_backend *ocl)
+{
+    struct {
+        cl_uint domain, bus, device, function;
+    } pci;
+    char path[96], buf[32];
+    cl_uint nv_bus, nv_slot;
+    FILE *f;
+    int r = 0;
+
+    if (clGetDeviceInfo(ocl->device, CL_DEVICE_PCI_BUS_INFO_KHR, sizeof(pci),
+                        &pci, NULL) != CL_SUCCESS) {
+        if (clGetDeviceInfo(ocl->device, CL_DEVICE_PCI_BUS_ID_NV,
+                            sizeof(nv_bus), &nv_bus, NULL) != CL_SUCCESS ||
+            clGetDeviceInfo(ocl->device, CL_DEVICE_PCI_SLOT_ID_NV,
+                            sizeof(nv_slot), &nv_slot, NULL) != CL_SUCCESS)
+            return 0;
+        pci.domain = 0;
+        pci.bus = nv_bus;
+        pci.device = nv_slot >> 3;
+        pci.function = nv_slot & 7;
+    }
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/removable",
+             pci.domain, pci.bus, pci.device, pci.function);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (fgets(buf, sizeof(buf), f))
+        r = strncmp(buf, "removable", 9) == 0;
+    fclose(f);
+    return r;
+}
+
+/* Profile of the selected device: forced by profile_opt, else detected. */
+static void select_arch(struct ocl_backend *ocl, const char *profile_opt)
+{
+    const char *why;
+
+    if (profile_opt && strcmp(profile_opt, "auto") != 0) {
+        if (strcmp(profile_opt, "cpu") == 0)
+            ocl->arch = OCL_ARCH_CPU;
+        else if (strcmp(profile_opt, "igpu") == 0)
+            ocl->arch = OCL_ARCH_IGPU;
+        else if (strcmp(profile_opt, "dgpu") == 0)
+            ocl->arch = OCL_ARCH_DGPU;
+        else if (strcmp(profile_opt, "egpu") == 0)
+            ocl->arch = OCL_ARCH_EGPU;
+        else
+            G_fatal_error(_("Invalid profile option <%s>"), profile_opt);
+        why = _("forced by profile=");
+    }
+    else if (!ocl->is_gpu) {
+        ocl->arch = OCL_ARCH_CPU;
+        why = _("CPU device");
+    }
+    else if (ocl->unified) {
+        ocl->arch = OCL_ARCH_IGPU;
+        why = _("GPU sharing host memory");
+    }
+    else if (pci_removable(ocl)) {
+        ocl->arch = OCL_ARCH_EGPU;
+        why = _("GPU on a removable PCI link (Thunderbolt/USB4)");
+    }
+    else {
+        ocl->arch = OCL_ARCH_DGPU;
+        why = _("GPU with its own memory");
+    }
+    G_message(_("OpenCL profile: %s (%s)"), ocl_arch_name(ocl->arch), why);
+}
+
 void ocl_init(struct ocl_backend *ocl, const char *device_opt,
-              const char *platform_opt)
+              const char *platform_opt, const char *profile_opt)
 {
     struct candidate cand[32];
     char *log = NULL;
@@ -244,10 +342,17 @@ void ocl_init(struct ocl_backend *ocl, const char *device_opt,
               ocl->device_name, ocl->platform_name,
               (unsigned long)(ocl->global_mem >> 20),
               (unsigned long)(ocl->max_alloc >> 20));
+    select_arch(ocl, profile_opt);
 }
 
 void ocl_free(struct ocl_backend *ocl)
 {
+    if (ocl->staging) {
+        clEnqueueUnmapMemObject(ocl->queue, ocl->staging, ocl->staging_ptr, 0,
+                                NULL, NULL);
+        clFinish(ocl->queue);
+        clReleaseMemObject(ocl->staging);
+    }
     if (ocl->program)
         clReleaseProgram(ocl->program);
     if (ocl->queue)
@@ -269,7 +374,14 @@ cl_mem ocl_alloc(struct ocl_backend *ocl, size_t n, const char *what)
                         "device maximum allocation of %lu MiB"),
                       what, (unsigned long)(n >> 20),
                       (unsigned long)(ocl->max_alloc >> 20));
-    m = clCreateBuffer(ocl->context, CL_MEM_READ_WRITE, n, NULL, &err);
+    /* Unified-memory devices (cpu, igpu) get buffers in host memory, which
+     * the driver can hand to the device without a copy. */
+    m = clCreateBuffer(ocl->context,
+                       CL_MEM_READ_WRITE | (ocl->arch == OCL_ARCH_CPU ||
+                                                    ocl->arch == OCL_ARCH_IGPU
+                                                ? CL_MEM_ALLOC_HOST_PTR
+                                                : 0),
+                       n, NULL, &err);
     if (err != CL_SUCCESS)
         G_fatal_error(_("OpenCL: allocating %lu MiB for <%s> failed: %s"),
                       (unsigned long)(n >> 20), what, ocl_errstr(err));
@@ -285,9 +397,55 @@ cl_mem ocl_upload(struct ocl_backend *ocl, const void *src, size_t n,
     return m;
 }
 
+/* Transfers of at least this size go through the pinned staging buffer
+ * on an eGPU. */
+#define STAGING_MIN (64 << 10)
+
+/* Pinned host buffer of at least n bytes, kept mapped (egpu). */
+static void *staging(struct ocl_backend *ocl, size_t n)
+{
+    cl_int err;
+
+    if (n <= ocl->staging_size)
+        return ocl->staging_ptr;
+    if (ocl->staging) {
+        clEnqueueUnmapMemObject(ocl->queue, ocl->staging, ocl->staging_ptr, 0,
+                                NULL, NULL);
+        clFinish(ocl->queue);
+        clReleaseMemObject(ocl->staging);
+    }
+    ocl->staging = clCreateBuffer(ocl->context,
+                                  CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, n,
+                                  NULL, &err);
+    ocl_check(err, "clCreateBuffer (staging)");
+    ocl->staging_ptr =
+        clEnqueueMapBuffer(ocl->queue, ocl->staging, CL_TRUE,
+                           CL_MAP_READ | CL_MAP_WRITE, 0, n, 0, NULL, NULL, &err);
+    ocl_check(err, "clEnqueueMapBuffer (staging)");
+    ocl->staging_size = n;
+    return ocl->staging_ptr;
+}
+
 void ocl_write(struct ocl_backend *ocl, cl_mem dst, size_t off, const void *src,
                size_t n)
 {
+    cl_int err;
+    void *p;
+
+    if (ocl->arch == OCL_ARCH_CPU || ocl->arch == OCL_ARCH_IGPU) {
+        p = clEnqueueMapBuffer(ocl->queue, dst, CL_TRUE, CL_MAP_WRITE, off, n,
+                               0, NULL, NULL, &err);
+        ocl_check(err, "clEnqueueMapBuffer");
+        memcpy(p, src, n);
+        ocl_check(clEnqueueUnmapMemObject(ocl->queue, dst, p, 0, NULL, NULL),
+                  "clEnqueueUnmapMemObject");
+        return;
+    }
+    if (ocl->arch == OCL_ARCH_EGPU && n >= STAGING_MIN) {
+        p = staging(ocl, n);
+        memcpy(p, src, n);
+        src = p;
+    }
     ocl_check(clEnqueueWriteBuffer(ocl->queue, dst, CL_TRUE, off, n, src, 0,
                                    NULL, NULL),
               "clEnqueueWriteBuffer");
@@ -296,18 +454,31 @@ void ocl_write(struct ocl_backend *ocl, cl_mem dst, size_t off, const void *src,
 void ocl_read(struct ocl_backend *ocl, cl_mem src, size_t off, void *dst,
               size_t n)
 {
+    cl_int err;
+    void *p;
+
+    if (ocl->arch == OCL_ARCH_CPU || ocl->arch == OCL_ARCH_IGPU) {
+        p = clEnqueueMapBuffer(ocl->queue, src, CL_TRUE, CL_MAP_READ, off, n, 0,
+                               NULL, NULL, &err);
+        ocl_check(err, "clEnqueueMapBuffer");
+        memcpy(dst, p, n);
+        ocl_check(clEnqueueUnmapMemObject(ocl->queue, src, p, 0, NULL, NULL),
+                  "clEnqueueUnmapMemObject");
+        return;
+    }
+    if (ocl->arch == OCL_ARCH_EGPU && n >= STAGING_MIN) {
+        p = staging(ocl, n);
+        ocl_check(clEnqueueReadBuffer(ocl->queue, src, CL_TRUE, off, n, p, 0,
+                                      NULL, NULL),
+                  "clEnqueueReadBuffer");
+        memcpy(dst, p, n);
+        return;
+    }
     ocl_check(clEnqueueReadBuffer(ocl->queue, src, CL_TRUE, off, n, dst, 0,
                                   NULL, NULL),
               "clEnqueueReadBuffer");
 }
 
-void ocl_copy(struct ocl_backend *ocl, cl_mem src, size_t src_off, cl_mem dst,
-              size_t dst_off, size_t n)
-{
-    ocl_check(clEnqueueCopyBuffer(ocl->queue, src, dst, src_off, dst_off, n, 0,
-                                  NULL, NULL),
-              "clEnqueueCopyBuffer");
-}
 
 cl_kernel ocl_kernel(struct ocl_backend *ocl, const char *name)
 {
@@ -326,4 +497,12 @@ void ocl_release(cl_mem *m)
         clReleaseMemObject(*m);
         *m = NULL;
     }
+}
+
+void ocl_copy(struct ocl_backend *ocl, cl_mem src, size_t src_off, cl_mem dst,
+              size_t dst_off, size_t n)
+{
+    ocl_check(clEnqueueCopyBuffer(ocl->queue, src, dst, src_off, dst_off, n, 0,
+                                  NULL, NULL),
+              "clEnqueueCopyBuffer");
 }

@@ -30,6 +30,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <grass/gis.h>
@@ -44,6 +45,8 @@
 #define ACT_RELU 3
 
 #define COB 4 /* Output channels per work-item in conv2d. */
+
+static void report_profile(void);
 
 const char *sr_variant_name(enum sr_variant v)
 {
@@ -388,7 +391,8 @@ static void set_bands(enum s2_band *dst, const enum s2_band *src, int n)
     memcpy(dst, src, n * sizeof(*dst));
 }
 
-void sr_model_load(struct sr_model *m, struct ocl_backend *ocl, const char *dir)
+void sr_model_load(struct sr_model *m, struct ocl_backend *ocl,
+                   const char *dir, int fp16)
 {
     static const enum s2_band all[S2_NBANDS] = {B02, B03, B04, B05, B06,
                                                 B07, B08, B8A, B11, B12};
@@ -396,11 +400,12 @@ void sr_model_load(struct sr_model *m, struct ocl_backend *ocl, const char *dir)
     static const enum s2_band rswir[6] = {B05, B06, B07, B8A, B11, B12};
     const int N = SR_TILE;
     char path[GPATH_MAX];
-    size_t plane, hr_plane, big;
+    size_t plane, hr_plane, big, fsz;
     int feat, max_side;
 
     memset(m, 0, sizeof(*m));
     m->ocl = ocl;
+    m->fp16 = fp16;
 
     if (file_exists(dir, "sr_model.safetensor", path, sizeof(path))) {
         m->variant = SR_ALL_X4;
@@ -471,6 +476,7 @@ void sr_model_load(struct sr_model *m, struct ocl_backend *ocl, const char *dir)
     }
 
     m->k_conv = ocl_kernel(ocl, "conv2d");
+    m->k_conv_cpu = ocl_kernel(ocl, "conv2d_cpu");
     m->k_dec = ocl_kernel(ocl, "decimate2");
     m->k_rx = ocl_kernel(ocl, "resize_x");
     m->k_ry = ocl_kernel(ocl, "resize_y");
@@ -490,9 +496,11 @@ void sr_model_load(struct sr_model *m, struct ocl_backend *ocl, const char *dir)
     big = m->variant == SR_ALL_X4 ? hr_plane : plane;
 
     m->in = ocl_alloc(ocl, m->nin * plane, "input tile");
-    m->ws_cat = ocl_alloc(ocl, 4 * feat * big, "features");
-    m->ws_a = ocl_alloc(ocl, feat * big, "features");
-    m->ws_b = ocl_alloc(ocl, feat * big, "features");
+    /* Feature maps: big counts float planes, half takes half of it. */
+    fsz = fp16 ? big / 2 : big;
+    m->ws_cat = ocl_alloc(ocl, 4 * feat * fsz, "features");
+    m->ws_a = ocl_alloc(ocl, feat * fsz, "features");
+    m->ws_b = ocl_alloc(ocl, feat * fsz, "features");
     m->rs_tmp = ocl_alloc(ocl, S2_NBANDS * (size_t)N * max_side * sizeof(float),
                           "resampling");
     m->lr_up = ocl_alloc(ocl, S2_NBANDS * hr_plane, "upsampled input");
@@ -519,8 +527,9 @@ void sr_model_load(struct sr_model *m, struct ocl_backend *ocl, const char *dir)
 
 void sr_model_free(struct sr_model *m)
 {
-    cl_kernel *k[] = {&m->k_conv, &m->k_dec,  &m->k_rx,  &m->k_ry,
-                      &m->k_diff, &m->k_mask, &m->k_add, &m->k_fft};
+    cl_kernel *k[] = {&m->k_conv, &m->k_conv_cpu, &m->k_dec,
+                      &m->k_rx,   &m->k_ry,       &m->k_diff,
+                      &m->k_mask, &m->k_add,      &m->k_fft};
     cl_mem *b[] = {&m->in,         &m->x10,        &m->x4,
                    &m->sub,        &m->f2out,      &m->rgbn_sr,
                    &m->fin,        &m->fus_out,    &m->ws_cat,
@@ -529,6 +538,7 @@ void sr_model_free(struct sr_model *m)
                    &m->hc_f2.mask, &m->hc_fus.mask};
     size_t i;
 
+    report_profile();
     for (i = 0; i < sizeof(k) / sizeof(k[0]); i++)
         if (*k[i])
             clReleaseKernel(*k[i]);
@@ -547,38 +557,134 @@ void sr_model_free(struct sr_model *m)
 
 #define ARG(k, i, v) ocl_check(clSetKernelArg(k, i, sizeof(v), &v), #k)
 
+/* Accumulated kernel times when profiling is enabled
+ * (I_SEN2SR_OPENCL_PROFILE set). */
+static struct {
+    cl_kernel k;
+    char name[32];
+    double ms, wall_ms, flops;
+    long calls;
+} prof[16];
+static int nprof;
+/* FLOPs of the next launch, set by run_conv() for the profile. */
+static double pending_flops;
+
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+
+static void launch_local(struct sr_model *m, cl_kernel k, int dims,
+                         const size_t *global, const size_t *local)
+{
+    cl_event ev;
+    cl_ulong t0, t1;
+    double w0 = 0.0, w1;
+    int i;
+
+    /* Wall time as well as event time: some drivers (rusticl on iris,
+     * Mesa 25.0) return wrong event timestamps. */
+    if (m->ocl->profile) {
+        clFinish(m->ocl->queue);
+        w0 = now_ms();
+    }
+    ocl_check(clEnqueueNDRangeKernel(m->ocl->queue, k, dims, NULL, global, local,
+                                     0, NULL, m->ocl->profile ? &ev : NULL),
+              "clEnqueueNDRangeKernel");
+    if (!m->ocl->profile) {
+        pending_flops = 0.0;
+        return;
+    }
+    clWaitForEvents(1, &ev);
+    w1 = now_ms();
+    clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0,
+                            NULL);
+    clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1,
+                            NULL);
+    clReleaseEvent(ev);
+    for (i = 0; i < nprof && prof[i].k != k; i++)
+        ;
+    if (i == nprof && nprof < 16) {
+        prof[nprof].k = k;
+        clGetKernelInfo(k, CL_KERNEL_FUNCTION_NAME, sizeof(prof[nprof].name),
+                        prof[nprof].name, NULL);
+        nprof++;
+    }
+    if (i < 16) {
+        prof[i].ms += (t1 - t0) * 1e-6;
+        prof[i].wall_ms += w1 - w0;
+        prof[i].flops += pending_flops;
+        prof[i].calls++;
+    }
+    pending_flops = 0.0;
+}
+
 static void launch(struct sr_model *m, cl_kernel k, int dims, size_t g0,
                    size_t g1, size_t g2)
 {
     size_t global[3] = {g0, g1, g2};
 
-    ocl_check(clEnqueueNDRangeKernel(m->ocl->queue, k, dims, NULL, global, NULL,
-                                     0, NULL, NULL),
-              "clEnqueueNDRangeKernel");
+    launch_local(m, k, dims, global, NULL);
+}
+
+static void report_profile(void)
+{
+    int p;
+
+    for (p = 0; p < nprof; p++) {
+        if (prof[p].flops > 0.0 && prof[p].wall_ms > 0.0)
+            G_message("kernel %-16s %8.1f ms (wall %8.1f ms) %7ld calls "
+                      "%8.1f GFLOP/s",
+                      prof[p].name, prof[p].ms, prof[p].wall_ms, prof[p].calls,
+                      prof[p].flops / (prof[p].wall_ms * 1e6));
+        else
+            G_message("kernel %-16s %8.1f ms (wall %8.1f ms) %7ld calls",
+                      prof[p].name, prof[p].ms, prof[p].wall_ms,
+                      prof[p].calls);
+    }
+    nprof = 0;
+}
+
+/* Non-zero when buffer b holds half-precision feature maps. */
+static int feat_half(const struct sr_model *m, cl_mem b)
+{
+    return m->fp16 && (b == m->ws_cat || b == m->ws_a || b == m->ws_b);
 }
 
 static void run_conv(struct sr_model *m, const struct sr_conv *c, cl_mem in,
                      int in_off, cl_mem out, int out_off, int n, int act,
                      int shuffle, cl_mem res, int res_off)
 {
-    cl_kernel k = m->k_conv;
+    int cpu = m->ocl->arch == OCL_ARCH_CPU;
+    cl_kernel k = cpu ? m->k_conv_cpu : m->k_conv;
+    cl_int in_h = feat_half(m, in), out_h = feat_half(m, out);
+    cl_int res_h = feat_half(m, res);
 
     ARG(k, 0, in);
     ARG(k, 1, in_off);
-    ARG(k, 2, c->cin);
-    ARG(k, 3, c->w);
-    ARG(k, 4, c->b);
-    ARG(k, 5, out);
-    ARG(k, 6, out_off);
-    ARG(k, 7, c->cout);
-    ARG(k, 8, n);
-    ARG(k, 9, n);
-    ARG(k, 10, c->k);
-    ARG(k, 11, act);
-    ARG(k, 12, shuffle);
-    ARG(k, 13, res);
-    ARG(k, 14, res_off);
-    launch(m, k, 3, n, n, (c->cout + COB - 1) / COB);
+    ARG(k, 2, in_h);
+    ARG(k, 3, c->cin);
+    ARG(k, 4, c->w);
+    ARG(k, 5, c->b);
+    ARG(k, 6, out);
+    ARG(k, 7, out_off);
+    ARG(k, 8, out_h);
+    ARG(k, 9, c->cout);
+    ARG(k, 10, n);
+    ARG(k, 11, n);
+    ARG(k, 12, c->k);
+    ARG(k, 13, act);
+    ARG(k, 14, shuffle);
+    ARG(k, 15, res);
+    ARG(k, 16, res_off);
+    ARG(k, 17, res_h);
+    pending_flops = 2.0 * c->cin * c->cout * c->k * c->k * n * n;
+    /* conv2d_cpu: one work-item per 8 pixels of a row. */
+    launch(m, k, 3, cpu ? (size_t)(n + 7) / 8 : (size_t)n, n,
+           (c->cout + COB - 1) / COB);
 }
 
 /* CNNSR forward pass on an n x n tile, followed by the positivity clamp
@@ -663,9 +769,7 @@ static void fft2(struct sr_model *m, int c, int n, float sign)
         ARG(k, 3, line_stride);
         ARG(k, 4, elem_stride);
         ARG(k, 5, sign);
-        ocl_check(clEnqueueNDRangeKernel(m->ocl->queue, k, 1, NULL, &global,
-                                         &local, 0, NULL, NULL),
-                  "clEnqueueNDRangeKernel(fft_lines)");
+        launch_local(m, k, 1, &global, &local);
     }
 }
 

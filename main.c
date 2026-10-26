@@ -126,7 +126,8 @@ int main(int argc, char *argv[])
 {
     struct GModule *module;
     struct Option *band_opt[S2_NBANDS], *output, *model_opt, *model_dir,
-        *scale_opt, *offset_opt, *overlap_opt, *device, *platform;
+        *scale_opt, *offset_opt, *overlap_opt, *device, *platform, *profile,
+        *precision;
     static const char *band_key[S2_NBANDS] = {
         "blue",     "green", "red",   "rededge1", "rededge2",
         "rededge3", "nir",   "nir08", "swir16",   "swir22"};
@@ -257,6 +258,33 @@ int main(int argc, char *argv[])
           "(case-insensitive)");
     platform->guisection = _("OpenCL");
 
+    profile = G_define_option();
+    profile->key = "profile";
+    profile->type = TYPE_STRING;
+    profile->options = "auto,cpu,igpu,dgpu,egpu";
+    profile->answer = "auto";
+    profile->description = _("Device profile choosing buffers and kernels");
+    G_asprintf((char **)&profile->descriptions,
+               "auto;%s;cpu;%s;igpu;%s;dgpu;%s;egpu;%s",
+               _("Detect from the device"),
+               _("Host-memory device (PoCL): mapped buffers, CPU kernel"),
+               _("GPU sharing host memory: zero-copy buffers"),
+               _("GPU with its own memory on internal PCIe"),
+               _("GPU behind a slow link (Thunderbolt, remote): pinned "
+                 "staging"));
+    profile->guisection = _("OpenCL");
+
+    precision = G_define_option();
+    precision->key = "precision";
+    precision->type = TYPE_STRING;
+    precision->options = "fp32,fp16";
+    precision->answer = "fp32";
+    precision->description = _("Storage type of the network feature maps");
+    G_asprintf((char **)&precision->descriptions, "fp32;%s;fp16;%s",
+               _("Single precision"),
+               _("Half precision storage, single precision arithmetic"));
+    precision->guisection = _("OpenCL");
+
     if (G_parser(argc, argv))
         exit(EXIT_FAILURE);
 
@@ -290,8 +318,9 @@ int main(int argc, char *argv[])
                           model_name, model_dir->key);
     }
 
-    ocl_init(&ocl, device->answer, platform->answer);
-    sr_model_load(&model, &ocl, model_path);
+    ocl_init(&ocl, device->answer, platform->answer, profile->answer);
+    sr_model_load(&model, &ocl, model_path,
+                  strcmp(precision->answer, "fp16") == 0);
     if (model_dir->answer && strcmp(model_opt->answer, "auto") != 0) {
         for (i = 0; i < (int)(sizeof(bundled) / sizeof(bundled[0])); i++)
             if (strcmp(bundled[i].name, model_opt->answer) == 0 &&
