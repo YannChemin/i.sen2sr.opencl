@@ -13,6 +13,7 @@ Usage (inside a GRASS session on a metric project):
 
 import importlib.util
 import sys
+from itertools import pairwise
 from pathlib import Path
 
 import grass.script as gs
@@ -44,13 +45,13 @@ def tile_layout(length, overlap):
             break
         s += TILE - overlap
         s = min(s, length - TILE)
-    cores = [0] + [(a + TILE + b) // 2 for a, b in zip(starts, starts[1:])]
+    cores = [0] + [(a + TILE + b) // 2 for a, b in pairwise(starts)]
     return starts, cores + [length]
 
 
 def main():
-    import torch  # noqa: PLC0415
-    from safetensors.torch import load_file  # noqa: PLC0415
+    import torch
+    from safetensors.torch import load_file  # ty: ignore[unresolved-import]
 
     sys.path.insert(0, sys.argv[1])
     overlap = 32
@@ -58,6 +59,8 @@ def main():
     size = 2 * TILE
     for model_dir in map(Path, sys.argv[2:]):
         spec = importlib.util.spec_from_file_location("load", model_dir / "load.py")
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {model_dir / 'load.py'}")
         loader = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(loader)
         model = loader.compiled_model(model_dir, "cpu")
@@ -112,6 +115,8 @@ def main():
                         :, (ys - y0) * s : (ye - y0) * s, (xs - x0) * s : (xe - x0) * s
                     ]
 
+        if ref is None:
+            raise RuntimeError("no tile was processed")
         out_names = sorted(
             gs.list_strings("raster", pattern="ref_out_*", mapset="."),
             key=lambda n: BANDS.index(n.split("@")[0].rsplit("_", 1)[1]),

@@ -73,7 +73,7 @@ def bundled_model(env, name):
     for root in filter(None, roots):
         if (Path(root) / rel / "model.safetensor").is_file():
             return str(Path(root) / rel)
-    pytest.skip(f"bundled model <{name}> is not installed")
+    pytest.skip(f"bundled model <{name}> is not installed")  # ty: ignore[too-many-positional-arguments]
 
 
 @pytest.fixture(scope="module")

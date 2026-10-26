@@ -14,8 +14,8 @@
  * and the convolution kernel:
  * - cpu:  host-memory device (PoCL): mapped buffers, a convolution
  *         kernel streaming 8 pixels per work-item with vector loads.
- * - igpu: GPU sharing host memory: zero-copy buffers (allocated in host
- *         memory, written and read by mapping instead of copying).
+ * - igpu: GPU sharing host memory: transfers by mapping instead of
+ *         copying; the driver places the buffers.
  * - dgpu: GPU with its own memory on internal PCIe: device buffers.
  * - egpu: GPU behind a slow link (Thunderbolt, PoCL-Remote): device
  *         buffers, transfers through a pinned staging buffer. */

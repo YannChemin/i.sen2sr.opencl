@@ -141,10 +141,11 @@ kernel runs, to suit the device:
   mapped instead of copied, and the convolutions use a kernel that
   computes 8 neighbouring pixels per work-item with 8-wide vector loads
   along the row; on a 4-core laptop CPU it runs the convolutions about
-  3 times faster than the GPU kernel.
-- *igpu*: a GPU sharing host memory (integrated graphics, APU). Buffers
-  are allocated in host memory and written and read by mapping them
-  (zero-copy).
+  6 times faster than the GPU kernel.
+- *igpu*: a GPU sharing host memory (integrated graphics, APU). Transfers
+  map the buffers instead of copying them; the driver places the
+  buffers (on Intel, buffers allocated in host memory slowed the
+  kernels by about 15 %).
 - *dgpu*: a GPU with its own memory on internal PCI Express. Buffers
   live in device memory.
 - *egpu*: a GPU behind a slow link, such as a Thunderbolt or USB4
@@ -162,8 +163,8 @@ carry most of the memory traffic, as IEEE half-precision numbers, read
 and written with the core OpenCL `vload_half`/`vstore_half` functions,
 so no half-precision extension is needed; the arithmetic, the input and
 output tiles and the hard constraint stay in single precision. It halves
-the memory of the feature maps. On a laptop CPU it made the convolutions
-about 1.5 times faster; on an integrated GPU it made no difference. The
+the memory of the feature maps; on a laptop CPU and on an integrated
+GPU, on mains power, it made no measurable difference in speed. The
 outputs differ from **precision**=*fp32* (the default) by at most about
 0.15 % in the tests.
 
