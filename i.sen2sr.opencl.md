@@ -132,6 +132,46 @@ network works at 2.5 m. On the host, one row of tiles of output is held
 in memory, about 800 MiB for the ten bands of a full 10980 x 10980 cell
 Sentinel-2 granule (proportionally less for narrower regions).
 
+### Device profile and precision
+
+The **profile** chooses how buffers are allocated and which convolution
+kernel runs, to suit the device:
+
+- *cpu*: a device working in host memory, such as PoCL. Buffers are
+  mapped instead of copied, and the convolutions use a kernel that
+  computes 8 neighbouring pixels per work-item with 8-wide vector loads
+  along the row; on a 4-core laptop CPU it runs the convolutions about
+  3 times faster than the GPU kernel.
+- *igpu*: a GPU sharing host memory (integrated graphics, APU). Buffers
+  are allocated in host memory and written and read by mapping them
+  (zero-copy).
+- *dgpu*: a GPU with its own memory on internal PCI Express. Buffers
+  live in device memory.
+- *egpu*: a GPU behind a slow link, such as a Thunderbolt or USB4
+  enclosure. Buffers live in device memory and large transfers go
+  through a pinned staging buffer.
+
+With **profile**=*auto* the profile is detected: *cpu* for a CPU
+device, *igpu* for a GPU that reports unified memory, *egpu* for a GPU
+whose PCI function Linux marks as removable (when the driver reports
+its PCI address), *dgpu* otherwise. The chosen profile and the reason
+are printed. Every profile gives the same result to rounding.
+
+**precision**=*fp16* stores the feature maps inside the networks, which
+carry most of the memory traffic, as IEEE half-precision numbers, read
+and written with the core OpenCL `vload_half`/`vstore_half` functions,
+so no half-precision extension is needed; the arithmetic, the input and
+output tiles and the hard constraint stay in single precision. It halves
+the memory of the feature maps. On a laptop CPU it made the convolutions
+about 1.5 times faster; on an integrated GPU it made no difference. The
+outputs differ from **precision**=*fp32* (the default) by at most about
+0.15 % in the tests.
+
+`I_SEN2SR_OPENCL_PROFILE=1` prints, for each OpenCL kernel, the event
+time and the wall-clock time (some drivers, such as rusticl on Intel
+iris, report wrong event times), and for the convolutions the achieved
+GFLOP/s.
+
 ### Performance
 
 With PoCL on a 4-core laptop CPU (Intel i7-1165G7), one 128 x 128 tile
