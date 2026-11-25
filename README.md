@@ -1,18 +1,22 @@
 # i.sen2sr.opencl
 
-GRASS GIS addon that super-resolves Sentinel-2 bands with the
-[SEN2SR](https://github.com/ESAOpenSR/sen2sr) "Lite" (convolutional)
-models on an OpenCL device (GPU or CPU). The published model weights
-(`*.safetensor`) are read directly, so neither Python nor PyTorch is
-needed at run time.
+GRASS GIS addon that super-resolves Sentinel-2 bands with the full
+[SEN2SR](https://github.com/ESAOpenSR/sen2sr) model (MambaSR + two
+Swin2SR stages) or the SEN2SRLite convolutional models on an OpenCL
+device (GPU or CPU). The published model weights (`*.safetensor`) are
+read directly, so neither Python nor PyTorch is needed at run time.
 
-Supported model variants (detected from the files in `model_dir`):
+Supported model variants, selected with `model=`:
 
 | Variant | Input | Output |
 |---|---|---|
-| `main` | all ten 10 m and 20 m bands | 2.5 m |
-| `NonReference_RGBN_x4` | B02, B03, B04, B08 (10 m) | 2.5 m |
-| `Reference_RSWIR_x2` | B05, B06, B07, B8A, B11, B12 (20 m), guided by the 10 m bands | 10 m |
+| `full` | all ten 10 m and 20 m bands | 2.5 m |
+| `main` | all ten 10 m and 20 m bands (SEN2SRLite) | 2.5 m |
+| `rgbn_x4` | B02, B03, B04, B08 (10 m) | 2.5 m |
+| `rswir_x2` | B05, B06, B07, B8A, B11, B12 (20 m), guided by the 10 m bands | 10 m |
+
+`full` uses the Mamba/Swin weights under `SEN2SR/SEN2SR/main`; the other
+three are the bundled Lite networks. Feature maps are single precision.
 
 The outputs are radiometrically consistent with the inputs: a hard
 constraint restores the low spatial frequencies of the input after the
@@ -27,9 +31,11 @@ See [i.sen2sr.opencl.md](i.sen2sr.opencl.md) for the full manual.
   Mesa rusticl/Clover, a vendor GPU driver, or PoCL for CPUs
 - OpenCL headers and ICD loader (`libOpenCL`), e.g. Debian packages
   `opencl-headers` and `ocl-icd-opencl-dev`
-- SEN2SRLite model weights (CC0) from
+- Model weights (CC0) from
   [huggingface.co/tacofoundation/SEN2SR](https://huggingface.co/tacofoundation/SEN2SR),
-  one directory per variant under `SEN2SRLite/`
+  one directory per variant; the Lite bundles are installed with the module,
+  the ~384 MB full bundle is downloaded on request or can be placed in
+  `$HOME/models/SEN2SR/SEN2SR/main`
 
 ## Build and install
 
@@ -50,17 +56,21 @@ at build time.
 
 ## Getting the models
 
+`model_dir` defaults to `$HOME/models/`. When the requested bundle is
+missing there, the module downloads it from Hugging Face (curl or wget
+is needed). To fetch the full model ahead of time:
+
 ```sh
-base=https://huggingface.co/tacofoundation/SEN2SR/resolve/main/SEN2SRLite/main
-mkdir -p SEN2SRLite_main
+base=https://huggingface.co/tacofoundation/SEN2SR/resolve/main/SEN2SR/main
+mkdir -p $HOME/models/SEN2SR/SEN2SR/main
 for f in model hard_constraint sr_model sr_hard_constraint f2_model \
          f2_hard_constraint; do
-    curl -L -o SEN2SRLite_main/$f.safetensor $base/$f.safetensor
+    curl -L -o $HOME/models/SEN2SR/SEN2SR/main/$f.safetensor $base/$f.safetensor
 done
 ```
 
-`NonReference_RGBN_x4` and `Reference_RSWIR_x2` only need `model` and
-`hard_constraint`.
+The Lite bundles are expected under `$HOME/models/SEN2SR/SEN2SRLite/`;
+they are also installed with the module and used as a fallback.
 
 ## Usage
 
@@ -73,23 +83,24 @@ g.region res=10
 i.sen2sr.opencl blue=T31TCJ_B02 green=T31TCJ_B03 red=T31TCJ_B04 \
     nir=T31TCJ_B08 rededge1=T31TCJ_B05 rededge2=T31TCJ_B06 \
     rededge3=T31TCJ_B07 nir08=T31TCJ_B8A swir16=T31TCJ_B11 \
-    swir22=T31TCJ_B12 offset=-1000 output=T31TCJ_sr \
-    model_dir=$HOME/models/SEN2SRLite_main
+    swir22=T31TCJ_B12 offset=-1000 output=T31TCJ_sr
 ```
 
-Outputs are FCELL maps named `<output>_<band>` (e.g. `T31TCJ_sr_B02`).
-Use `offset=-1000` for L2A products of processing baseline 04.00 and
-later, and `scale=1` for inputs already in reflectance. The OpenCL
-device is chosen with `device=auto|gpu|cpu` and `platform=<name>`.
+Add `model=full` to use the Mamba/Swin model instead of the bundled Lite
+`main` network. Outputs are FCELL maps named `<output>_<band>`
+(e.g. `T31TCJ_sr_B02`). Use `offset=-1000` for L2A products of
+processing baseline 04.00 and later, and `scale=1` for inputs already in
+reflectance. The OpenCL device is chosen with `device=auto|gpu|cpu` and
+`platform=<name>`.
 
 ## Tests
 
-Tests use pytest and need an OpenCL device (PoCL is enough). Tests that
-run a model are skipped unless a model directory is given:
+Tests use pytest and need an OpenCL device (PoCL is enough). The Lite
+tests use the installed weights; the full-model test needs an explicit
+weight directory:
 
 ```sh
-export I_SEN2SR_OPENCL_RGBN=$HOME/models/SEN2SRLite_NonReference_RGBN_x4
-export I_SEN2SR_OPENCL_MAIN=$HOME/models/SEN2SRLite_main
+export I_SEN2SR_OPENCL_FULL=$HOME/models/SEN2SR/SEN2SR/main
 export I_SEN2SR_OPENCL_PLATFORM=Portable  # optional
 PYTHONPATH=$(grass --config python_path) python3 -m pytest tests/
 ```

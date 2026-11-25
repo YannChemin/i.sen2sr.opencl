@@ -1,6 +1,8 @@
-# SEN2SRLite model weights
+# Bundled SEN2SRLite model weights
 
-The three SEN2SRLite variants used by *i.sen2sr.opencl*, copied unchanged
+The full Mamba/Swin SEN2SR weights (about 384 MB) are not bundled; they
+are downloaded into `$HOME/models/SEN2SR/SEN2SR/main` on request with
+`model=full`. The three SEN2SRLite variants used by *i.sen2sr.opencl*, copied unchanged
 from the SEN2SR model repository (CC0 1.0 licence):
 <https://huggingface.co/tacofoundation/SEN2SR/tree/main/SEN2SRLite>
 

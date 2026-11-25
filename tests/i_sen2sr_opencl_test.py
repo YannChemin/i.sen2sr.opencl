@@ -1,5 +1,8 @@
 """Tests for i.sen2sr.opencl."""
 
+import os
+from pathlib import Path
+
 import grass.script as gs
 import pytest
 from conftest import BAND_KEYS, COLS, RES, ROWS, band_options, bundled_model
@@ -233,9 +236,9 @@ def test_custom_model_dir_is_used(session, device_options):
     assert info["rows"] == 4 * ROWS
 
 
-@pytest.mark.parametrize("option", ["profile", "precision"])
+@pytest.mark.parametrize("option", ["profile"])
 def test_rejects_invalid_device_option(session, option):
-    """profile= and precision= only take their listed values."""
+    """profile= only takes its listed values."""
     tools = Tools(session=session)
     with pytest.raises(ToolError):
         tools.i_sen2sr_opencl(
@@ -244,27 +247,16 @@ def test_rejects_invalid_device_option(session, option):
 
 
 @pytest.mark.parametrize(
-    ("profile", "precision", "tolerance"),
-    [
-        ("cpu", "fp32", 1e-4),
-        ("igpu", "fp32", 1e-4),
-        ("dgpu", "fp32", 1e-4),
-        ("egpu", "fp32", 1e-4),
-        ("dgpu", "fp16", 5e-3),
-        ("cpu", "fp16", 5e-3),
-    ],
+    ("profile", "tolerance"),
+    [("cpu", 1e-4), ("igpu", 1e-4), ("dgpu", 1e-4), ("egpu", 1e-4)],
 )
-def test_profiles_and_precision_match_default(
-    rgbn_run, device_options, profile, precision, tolerance
-):
-    """Every profile gives the default result; half-precision feature maps
-    stay within a small relative error of it."""
+def test_profiles_match_default(rgbn_run, device_options, profile, tolerance):
+    """Every OpenCL device profile gives the default result."""
     session, tools, _ = rgbn_run
-    out = f"sr_{profile}_{precision}"
+    out = f"sr_{profile}"
     tools.i_sen2sr_opencl(
         output=out,
         profile=profile,
-        precision=precision,
         **band_options(*RGBN),
         **device_options,
     )
@@ -275,5 +267,38 @@ def test_profiles_and_precision_match_default(
         expression=f"diff_{out} = abs({out}_B04 - sr_B04) / max(abs(sr_B04), 1)"
     )
     worst = native.r_univar(map=f"diff_{out}", format="json").json["max"]
-    print(f"{profile} {precision}: max relative difference {worst:.2e}")
+    print(f"{profile}: max relative difference {worst:.2e}")
     assert worst <= tolerance
+
+
+@pytest.fixture(scope="module")
+def full_model_dir():
+    """Directory of the full SEN2SR weights, if provided."""
+    path = os.environ.get("I_SEN2SR_OPENCL_FULL")
+    if not path or not (Path(path) / "sr_model.safetensor").is_file():
+        pytest.skip("I_SEN2SR_OPENCL_FULL is not set to full SEN2SR weights")
+    return path
+
+
+def test_full_model(session, device_options, full_model_dir):
+    """model=full writes all ten bands at 2.5 m with the Mamba/Swin net."""
+    tools = Tools(session=session)
+    tools.i_sen2sr_opencl(
+        output="full",
+        model="full",
+        model_dir=full_model_dir,
+        **band_options(*BAND_KEYS),
+        **device_options,
+    )
+    maps = tools.g_list(type="raster", pattern="full_*", format="json").json
+    assert sorted(m["name"] for m in maps) == sorted(
+        f"full_{band}" for band in BAND_KEYS.values()
+    )
+    for band in BAND_KEYS.values():
+        info = tools.r_info(map=f"full_{band}", format="json").json
+        assert info["rows"] == 4 * ROWS
+        assert info["cols"] == 4 * COLS
+        assert info["datatype"] == "FCELL"
+        lr = tools.r_univar(map=f"s2_{band}", format="json").json
+        hr = native_univar(session, f"full_{band}")
+        assert hr["mean"] == pytest.approx(lr["mean"], rel=0.02), band

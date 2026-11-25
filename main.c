@@ -2,9 +2,9 @@
  *
  * MODULE:       i.sen2sr.opencl
  * AUTHOR(S):    Yann Chemin <dr.yann.chemin gmail.com>
- * PURPOSE:      Super-resolve Sentinel-2 bands with the SEN2SRLite models
- *               (10 m RGBN and 20 m bands to 2.5 m, or 20 m bands to
- *               10 m) on an OpenCL device.
+ * PURPOSE:      Super-resolve Sentinel-2 bands with the full SEN2SR
+ *               (MambaSR + Swin2SR) or SEN2SRLite models on an OpenCL
+ *               device.
  * COPYRIGHT:    (C) 2026 by Yann Chemin and the GRASS Development Team
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -22,17 +22,10 @@
 #include <grass/raster.h>
 
 #include "ocl_backend.h"
-#include "sen2sr_model.h"
+#include "sen2sr.h"
 
 static const char *band_suffix[S2_NBANDS] = {"B02", "B03", "B04", "B05", "B06",
                                              "B07", "B08", "B8A", "B11", "B12"};
-
-/* Bundled model directories (see models/README.md), by variant. */
-static const struct {
-    const char *name;
-    enum sr_variant variant;
-} bundled[] = {
-    {"main", SR_ALL_X4}, {"rgbn_x4", SR_RGBN_X4}, {"rswir_x2", SR_RSWIR_X2}};
 
 /* Path of a bundled model directory installed with the module, searched
  * like G_find_etc() (GRASS_ADDON_ETC, then $GISBASE/etc) and in the
@@ -54,6 +47,30 @@ static char *find_bundled_model(const char *name)
             return G_store(path);
     }
     return NULL;
+}
+
+/* Variant named by the <model> option, or -1 for full/auto. */
+static int named_variant(const char *name)
+{
+    if (strcmp(name, "main") == 0)
+        return SR_ALL_X4;
+    if (strcmp(name, "rgbn_x4") == 0)
+        return SR_RGBN_X4;
+    if (strcmp(name, "rswir_x2") == 0)
+        return SR_RSWIR_X2;
+    return -1;
+}
+
+/* Default search root for published model weights, $HOME/models/, where
+ * missing bundles are downloaded on request. */
+static const char *default_model_root(void)
+{
+    static char root[GPATH_MAX];
+    const char *home = getenv("HOME");
+
+    if (!*root)
+        snprintf(root, sizeof(root), "%s/models", home ? home : ".");
+    return root;
 }
 
 /* Tile origins along an axis of padded length len (>= SR_TILE, even), and
@@ -126,8 +143,7 @@ int main(int argc, char *argv[])
 {
     struct GModule *module;
     struct Option *band_opt[S2_NBANDS], *output, *model_opt, *model_dir,
-        *scale_opt, *offset_opt, *overlap_opt, *device, *platform, *profile,
-        *precision;
+        *scale_opt, *offset_opt, *overlap_opt, *device, *platform, *profile;
     static const char *band_key[S2_NBANDS] = {
         "blue",     "green", "red",   "rededge1", "rededge2",
         "rededge3", "nir",   "nir08", "swir16",   "swir22"};
@@ -143,7 +159,7 @@ int main(int argc, char *argv[])
         "Sentinel-2 B11 (SWIR 1.6 um, 20 m)",
         "Sentinel-2 B12 (SWIR 2.2 um, 20 m)"};
     struct ocl_backend ocl;
-    struct sr_model model;
+    struct sen2sr model;
     struct Cell_head win, hr;
     const char *in_names[S2_NBANDS];
     char out_names[S2_NBANDS][GNAME_MAX];
@@ -156,6 +172,7 @@ int main(int argc, char *argv[])
     double scale, offset;
     size_t tile_plane, out_plane, hr_cols;
     const char *model_name, *model_path;
+    char path[GPATH_MAX];
     char *desc;
     int i, b, r, c, has_20m;
 
@@ -169,8 +186,8 @@ int main(int argc, char *argv[])
     G_add_keyword(_("GPU"));
     G_add_keyword(_("OpenCL"));
     module->description =
-        _("Super-resolves Sentinel-2 bands with the SEN2SRLite models on an "
-          "OpenCL device.");
+        _("Super-resolves Sentinel-2 bands with the full SEN2SR or the "
+          "SEN2SRLite models on an OpenCL device.");
 
     for (b = 0; b < S2_NBANDS; b++) {
         band_opt[b] = G_define_standard_option(G_OPT_R_INPUT);
@@ -189,27 +206,32 @@ int main(int argc, char *argv[])
     model_opt = G_define_option();
     model_opt->key = "model";
     model_opt->type = TYPE_STRING;
-    model_opt->options = "auto,main,rgbn_x4,rswir_x2";
+    model_opt->options = "auto,main,rgbn_x4,rswir_x2,full";
     model_opt->answer = "auto";
-    model_opt->label = _("SEN2SRLite model");
+    model_opt->label = _("SEN2SR model");
     model_opt->description =
-        _("The three models are installed with the module; auto uses main "
-          "when 20 m bands are given, else rgbn_x4");
-    G_asprintf(&desc, "auto;%s;main;%s;rgbn_x4;%s;rswir_x2;%s",
+        _("The three Lite models are installed with the module; full needs "
+          "the SEN2SR weights in model_dir; auto uses main when 20 m bands "
+          "are given, else rgbn_x4");
+    G_asprintf(&desc,
+               "auto;%s;main;%s;rgbn_x4;%s;rswir_x2;%s;full;%s",
                _("main if any 20 m band is given, else rgbn_x4"),
-               _("all 10 bands to 2.5 m"), _("B02, B03, B04, B08 to 2.5 m"),
-               _("20 m bands to 10 m, guided by the 10 m bands"));
+               _("SEN2SRLite: all 10 bands to 2.5 m"),
+               _("SEN2SRLite: B02, B03, B04, B08 to 2.5 m"),
+               _("SEN2SRLite: 20 m bands to 10 m, guided by the 10 m bands"),
+               _("Full SEN2SR (MambaSR and Swin2SR): all 10 bands to 2.5 m"));
     model_opt->descriptions = desc;
     model_opt->guisection = _("Model");
 
     model_dir = G_define_standard_option(G_OPT_M_DIR);
     model_dir->key = "model_dir";
     model_dir->required = NO;
-    model_dir->label = _("Directory of other SEN2SRLite weights");
+    model_dir->answer = G_store(default_model_root());
+    model_dir->label = _("Root directory of SEN2SR model weights");
     model_dir->description =
-        _("Use the weights in this directory (one SEN2SRLite variant as "
-          "published at huggingface.co/tacofoundation/SEN2SR) instead of "
-          "the installed ones");
+        _("Search this directory for the published SEN2SR/SEN2SRLite "
+          "bundles (default: $HOME/models/); a missing requested bundle is "
+          "downloaded here from huggingface.co/tacofoundation/SEN2SR");
     model_dir->guisection = _("Model");
 
     scale_opt = G_define_option();
@@ -274,17 +296,6 @@ int main(int argc, char *argv[])
                  "staging"));
     profile->guisection = _("OpenCL");
 
-    precision = G_define_option();
-    precision->key = "precision";
-    precision->type = TYPE_STRING;
-    precision->options = "fp32,fp16";
-    precision->answer = "fp32";
-    precision->description = _("Storage type of the network feature maps");
-    G_asprintf((char **)&precision->descriptions, "fp32;%s;fp16;%s",
-               _("Single precision"),
-               _("Half precision storage, single precision arithmetic"));
-    precision->guisection = _("OpenCL");
-
     if (G_parser(argc, argv))
         exit(EXIT_FAILURE);
 
@@ -297,9 +308,11 @@ int main(int argc, char *argv[])
         G_fatal_error(_("Option <%s> must be an even number of cells"),
                       overlap_opt->key);
 
-    /* Model choice: auto picks the model that uses the given bands. The
+    /* Model choice: auto keeps the Lite model that uses the given bands;
+     * the full SEN2SR model is selected explicitly with model=full. The
      * 20 m-to-10 m model is a different product (10 m output) and is only
-     * used on request. */
+     * used on request. Missing bundles in the default root are downloaded
+     * there. */
     has_20m = 0;
     for (b = 0; b < S2_NBANDS; b++)
         if (b != B02 && b != B03 && b != B04 && b != B08 && band_opt[b]->answer)
@@ -307,33 +320,38 @@ int main(int argc, char *argv[])
     model_name = strcmp(model_opt->answer, "auto") != 0 ? model_opt->answer
                  : has_20m                              ? "main"
                                                         : "rgbn_x4";
-    if (model_dir->answer)
+
+    if (strcmp(model_dir->answer, default_model_root()) != 0)
         model_path = model_dir->answer;
-    else {
-        model_path = find_bundled_model(model_name);
-        if (!model_path)
-            G_fatal_error(_("The installed SEN2SRLite model <%s> was not "
-                            "found; reinstall the module or give the weights "
-                            "with <%s>"),
-                          model_name, model_dir->key);
-    }
+    else if (sen2sr_default_model(default_model_root(), model_name, path,
+                                  sizeof(path)) ||
+             sen2sr_ensure_default_model(default_model_root(), model_name,
+                                         path, sizeof(path)))
+        model_path = G_store(path);
+    else if (strcmp(model_name, "full") != 0 &&
+             (model_path = find_bundled_model(model_name)) != NULL)
+        G_warning(_("Using the %s weights installed with the module; put "
+                    "weights in <%s> to use them by default"),
+                  model_name, default_model_root());
+    else
+        G_fatal_error(_("Model <%s> was not found in <%s>"), model_name,
+                      default_model_root());
 
     ocl_init(&ocl, device->answer, platform->answer, profile->answer);
-    sr_model_load(&model, &ocl, model_path,
-                  strcmp(precision->answer, "fp16") == 0);
-    if (model_dir->answer && strcmp(model_opt->answer, "auto") != 0) {
-        for (i = 0; i < (int)(sizeof(bundled) / sizeof(bundled[0])); i++)
-            if (strcmp(bundled[i].name, model_opt->answer) == 0 &&
-                bundled[i].variant != model.variant)
-                G_fatal_error(_("<%s> holds the %s model, not <%s>"),
-                              model_dir->answer, sr_variant_name(model.variant),
-                              model_opt->answer);
+    sen2sr_load(&model, &ocl, model_path, model_opt->answer);
+    if (strcmp(model_opt->answer, "auto") != 0) {
+        int want = named_variant(model_opt->answer);
+        int got = model.engine == SEN2SR_LITE ? (int)model.lite.variant : -2;
+
+        if (want >= 0 && got != want)
+            G_fatal_error(_("<%s> holds the %s model, not <%s>"), model_path,
+                          sen2sr_name(&model), model_opt->answer);
     }
     S = model.scale;
     nin = model.nin;
     nout = model.nout;
     G_message(_("Model: %s, %d input bands, %d output bands, x%d"),
-              sr_variant_name(model.variant), nin, nout, S);
+              sen2sr_name(&model), nin, nout, S);
 
     /* Every band the model reads is required; others are refused rather
      * than silently dropped. */
@@ -344,12 +362,12 @@ int main(int argc, char *argv[])
             used |= model.in_bands[i] == (enum s2_band)b;
         if (used && !band_opt[b]->answer)
             G_fatal_error(_("The %s model needs option <%s> (%s)"),
-                          sr_variant_name(model.variant), band_opt[b]->key,
+                          sen2sr_name(&model), band_opt[b]->key,
                           band_suffix[b]);
         if (!used && band_opt[b]->answer)
             G_fatal_error(_("Option <%s> is not used by the %s model; "
                             "remove it or use a model that reads %s"),
-                          band_opt[b]->key, sr_variant_name(model.variant),
+                          band_opt[b]->key, sen2sr_name(&model),
                           band_suffix[b]);
     }
     for (i = 0; i < nin; i++)
@@ -446,7 +464,7 @@ int main(int argc, char *argv[])
                            strip + ((size_t)i * T + r) * Wp + x0,
                            sizeof(float) * T);
 
-            sr_model_run(&model, tile, tile_out);
+            sen2sr_run(&model, tile, tile_out);
 
             /* Keep the core of the tile. */
             for (i = 0; i < nout; i++)
@@ -493,7 +511,7 @@ int main(int argc, char *argv[])
 
         Rast_close(out_fd[i]);
         snprintf(title, sizeof(title), "Sentinel-2 %s super-resolved by %s",
-                 band_suffix[band], sr_variant_name(model.variant));
+                 band_suffix[band], sen2sr_name(&model));
         Rast_put_cell_title(out_names[i], title);
         if (Rast_read_colors(band_opt[band]->answer, "", &colors) > 0) {
             Rast_write_colors(out_names[i], G_mapset(), &colors);
@@ -515,7 +533,7 @@ int main(int argc, char *argv[])
     G_free(yc);
     G_free(xs);
     G_free(xc);
-    sr_model_free(&model);
+    sen2sr_free(&model);
     ocl_free(&ocl);
 
     G_message(_("Written %d raster maps at %g x %g map units"), nout, hr.ew_res,

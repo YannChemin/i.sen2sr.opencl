@@ -1,9 +1,10 @@
 """pytest fixtures for i.sen2sr.opencl.
 
 The module always needs an OpenCL device (PoCL is enough). The three
-SEN2SRLite models are installed with the module, so the model tests need
-no download. I_SEN2SR_OPENCL_PLATFORM optionally selects the OpenCL
-platform.
+SEN2SRLite models are installed with the module, so the Lite tests need
+no download. I_SEN2SR_OPENCL_FULL points at the full SEN2SR weights for
+the full-model test. I_SEN2SR_OPENCL_PLATFORM optionally selects the
+OpenCL platform.
 """
 
 import os

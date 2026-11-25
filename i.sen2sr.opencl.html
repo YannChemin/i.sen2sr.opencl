@@ -1,9 +1,11 @@
 <h2>DESCRIPTION</h2>
 <p><em>i.sen2sr.opencl</em> increases the spatial resolution of Sentinel-2 bands
 with the SEN2SR super-resolution models, returning the same bands on a
-finer grid. It runs the "Lite" (convolutional) SEN2SR networks on an
-OpenCL device (GPU or CPU), reading the published model weights
-directly. Neither Python nor PyTorch is needed at run time.</p>
+finer grid. It runs both the full SEN2SR network (MambaSR for the 10 m
+bands and two Swin2SR stages for reference and fusion) and the "Lite"
+(convolutional) SEN2SRLite networks on an OpenCL device (GPU or CPU),
+reading the published model weights directly. Neither Python nor
+PyTorch is needed at run time.</p>
 <p>SEN2SR is designed to be radiometrically consistent: after the neural
 network has added spatial detail, a hard constraint replaces the low
 spatial frequencies of the output with those of the input. Averaging the
@@ -21,10 +23,17 @@ with the <b>model</b> option:</p>
 <li><b>rswir_x2</b>: the six 20 m bands (B05, B06, B07, B8A, B11, B12) to
   10 m, guided by the four 10 m bands.</li>
 </ul>
-<p>With <b>model</b>=<em>auto</em>, the default, the model follows the bands
+<p>The full SEN2SR model is selected with <b>model</b>=<em>full</em>. It takes all
+ten bands to 2.5 m: a reference Swin2SR stage first brings the 20 m
+bands to 10 m, the MambaSR RGBN stage super-resolves B04, B03, B02 and
+B08 by a factor of four, and a fusion Swin2SR stage transfers their
+detail to the upsampled 20 m bands. Three Fourier hard constraints keep
+the low spatial frequencies of the input.</p>
+<p>With <b>model</b>=<em>auto</em>, the default, a Lite model follows the bands
 given: <b>main</b> if any 20 m band is given, <b>rgbn_x4</b> otherwise.
 <b>rswir_x2</b> produces a different result, the 20 m bands on the 10 m
-grid, and is only used when requested.</p>
+grid, and is only used when requested. <b>full</b> is only used when
+explicitly named.</p>
 <p>Each band is given through its own option: <b>blue</b> (B02), <b>green</b>
 (B03), <b>red</b> (B04), <b>nir</b> (B08), <b>rededge1</b> (B05), <b>rededge2</b>
 (B06), <b>rededge3</b> (B07), <b>nir08</b> (B8A), <b>swir16</b> (B11) and
@@ -40,21 +49,26 @@ changed. Output values are in the units of the input, as floating point
 (FCELL) maps with the colour table of the matching input band.</p>
 <h3>Models</h3>
 <p>The weights are those published under the CC0 licence at
-<a href="https://huggingface.co/tacofoundation/SEN2SR">huggingface.co/tacofoundation/SEN2SR</a>
-(<code>SEN2SRLite/main</code>, <code>SEN2SRLite/NonReference_RGBN_x4</code> and
-<code>SEN2SRLite/Reference_RSWIR_x2</code>), about 15 MB in total. They are
+<a href="https://huggingface.co/tacofoundation/SEN2SR">huggingface.co/tacofoundation/SEN2SR</a>.
+The three Lite bundles (<code>SEN2SRLite/main</code>,
+<code>SEN2SRLite/NonReference_RGBN_x4</code> and
+<code>SEN2SRLite/Reference_RSWIR_x2</code>), about 15 MB in total, are
 installed with the module in its <code>etc</code> directory
-(<code>models/main</code>, <code>models/rgbn_x4</code>, <code>models/rswir_x2</code>), where
-<em>i.sen2sr.opencl</em> finds them; no download is needed.</p>
-<p><b>model_dir</b> replaces the installed weights with those of another
-directory holding one SEN2SRLite variant, e.g. retrained weights with the
-same architecture: <code>model.safetensor</code> and
-<code>hard_constraint.safetensor</code>, plus <code>sr_model</code>,
+(<code>models/main</code>, <code>models/rgbn_x4</code>, <code>models/rswir_x2</code>).</p>
+<p><b>model_dir</b> is the root directory under which the published bundles
+are searched. It defaults to <code>$HOME/models/</code>, where the known layouts
+are <code>SEN2SR/SEN2SR/main</code> for the full model and
+<code>SEN2SR/SEN2SRLite/&lt;variant&gt;</code> for the Lite models. If the requested
+bundle is not found there, it is downloaded from Hugging Face into that
+directory (curl or wget is needed); when no download is possible, the
+installed Lite weights are used as a fallback. For a directory holding
+one variant directly, <code>model.safetensor</code> and
+<code>hard_constraint.safetensor</code> are needed, plus <code>sr_model</code>,
 <code>sr_hard_constraint</code>, <code>f2_model</code> and
-<code>f2_hard_constraint</code> for the main model. The variant is recognised
-from the files; if <b>model</b> is also set, the directory must hold that
-variant. The full, Mamba-based SEN2SR models (the <code>SEN2SR/</code>
-directories) are not supported.</p>
+<code>f2_hard_constraint</code> for the main and full models. The variant is
+recognised from the files; if <b>model</b> is also set, the directory must
+hold that variant. The full model needs about 384 MB of weights and runs
+in single precision.</p>
 <h3>Input values</h3>
 <p>The models work on surface reflectance (Sentinel-2 L2A) in the 0-1
 range. Input values are converted with reflectance = (value +
@@ -106,11 +120,11 @@ contains the given text, e.g. <code>rusticl</code>, <code>Clover</code>, <code>A
 (PoCL, CPU). If the kernels do not build on one device, the next
 candidate is tried. The kernels need OpenCL 1.1 in single precision.</p>
 <p>The device memory needed is about 50 MiB for <b>rgbn_x4</b>,
-15 MiB for <b>rswir_x2</b> and 200 MiB for <b>main</b>, whose fusion
-network works at 2.5 m. On the host, one row of tiles of output is held
+15 MiB for <b>rswir_x2</b>, 200 MiB for <b>main</b> and over 1 GiB for
+<b>full</b>, whose Swin2SR fusion stage works at 2.5 m. On the host, one row of tiles of output is held
 in memory, about 800 MiB for the ten bands of a full 10980 x 10980 cell
 Sentinel-2 granule (proportionally less for narrower regions).</p>
-<h3>Device profile and precision</h3>
+<h3>Device profile</h3>
 <p>The <b>profile</b> chooses how buffers are allocated and which convolution
 kernel runs, to suit the device:</p>
 <ul>
@@ -134,15 +148,8 @@ device, <em>igpu</em> for a GPU that reports unified memory, <em>egpu</em> for a
 whose PCI function Linux marks as removable (when the driver reports
 its PCI address), <em>dgpu</em> otherwise. The chosen profile and the reason
 are printed. Every profile gives the same result to rounding.</p>
-<p><b>precision</b>=<em>fp16</em> stores the feature maps inside the networks, which
-carry most of the memory traffic, as IEEE half-precision numbers, read
-and written with the core OpenCL <code>vload_half</code>/<code>vstore_half</code> functions,
-so no half-precision extension is needed; the arithmetic, the input and
-output tiles and the hard constraint stay in single precision. It halves
-the memory of the feature maps; on a laptop CPU and on an integrated
-GPU, on mains power, it made no measurable difference in speed. The
-outputs differ from <b>precision</b>=<em>fp32</em> (the default) by at most about
-0.15&nbsp;% in the tests.</p>
+<p>Feature maps are stored in single precision. Network arithmetic is
+single precision in every case.</p>
 <p><code>I_SEN2SR_OPENCL_PROFILE=1</code> prints, for each OpenCL kernel, the event
 time and the wall-clock time (some drivers, such as rusticl on Intel
 iris, report wrong event times), and for the convolutions the achieved
@@ -178,6 +185,15 @@ i.sen2sr.opencl blue=T31TCJ_B02 green=T31TCJ_B03 red=T31TCJ_B04 \
     rededge3=T31TCJ_B07 nir08=T31TCJ_B8A swir16=T31TCJ_B11 \
     swir22=T31TCJ_B12 offset=-1000 output=T31TCJ_sr
 d.rgb red=T31TCJ_sr_B04 green=T31TCJ_sr_B03 blue=T31TCJ_sr_B02
+</pre></div>
+<h3>Full SEN2SR</h3>
+<p>With <b>model</b>=<em>full</em> the Mamba/Swin network is used instead of the
+bundled Lite <code>main</code> network. The full weights are downloaded into
+<code>$HOME/models/</code> on first use; give <b>model_dir</b> to use another copy:</p>
+<div class="code"><pre>i.sen2sr.opencl blue=T31TCJ_B02 green=T31TCJ_B03 red=T31TCJ_B04 \
+    nir=T31TCJ_B08 rededge1=T31TCJ_B05 rededge2=T31TCJ_B06 \
+    rededge3=T31TCJ_B07 nir08=T31TCJ_B8A swir16=T31TCJ_B11 \
+    swir22=T31TCJ_B12 offset=-1000 output=T31TCJ_full model=full
 </pre></div>
 <h3>RGB and NIR only</h3>
 <p>With the four 10 m bands only, the <b>rgbn_x4</b> model is used:</p>

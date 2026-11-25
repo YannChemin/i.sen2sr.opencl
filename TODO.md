@@ -9,10 +9,9 @@ Rules: `~/.claude/CLAUDE.md`, "OpenCL code: adapt to the device it runs on".
       `cl_khr_pci_bus_info` or the NVIDIA query).
 - [x] `profile=auto|cpu|igpu|dgpu|egpu`, detected by default, chosen
       profile and reason printed.
-- [x] `precision=fp32|fp16`: CNN feature maps stored as half
-      (`vload_half`/`vstore_half`, no `cl_khr_fp16` needed), arithmetic,
-      input/output tiles and hard constraint in float. Max relative
-      difference to fp32 in the tests: 1.4e-3.
+- [x] Full SEN2SR (MambaSR + two Swin2SR stages) added alongside the
+      Lite networks, selected with `model=full`; single precision only,
+      so the old `precision=fp16` option was removed.
 - [x] `cpu`: host-memory buffers; `igpu`/`cpu`: transfers by map/unmap
       (host-memory buffers on `igpu` slowed Intel kernels by about 15 %).
 - [x] `egpu`: pinned staging buffer for large transfers.
